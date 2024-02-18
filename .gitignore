@@ -25,6 +25,8 @@ replay_pid*
 
 # Environment file
 .env
+.properties
+kafka.properties
 
 .gradle
 **/build/
@@ -47,3 +49,5 @@ gradle-app.setting
 .project
 # JDT-specific (Eclipse Java Development Tools)
 .classpath
+.vscode
+.idea
