@@ -39,3 +39,8 @@ Apache Kafka is instrumental in Trenova's architecture, underpinning a variety o
 - [Log Aggregation, Metrics Collection, Data Integration, Microservices Communication, Real-time Notifications, Table Change Alerts](https://en.wikipedia.org/wiki/Main_Page)
 - [Kafka Streams](https://kafka.apache.org/documentation/streams/)
 - [Kafka Connect](https://kafka.apache.org/documentation/#connect)
+
+
+## NOTES - 
+
+Trenova Kafka is still a work in progress. We will be rewriting the python implementation in Java and Scala.
