@@ -19,6 +19,8 @@ repositories {
 
 dependencies {
     implementation 'org.apache.kafka:kafka-clients:3.6.1'
+    implementation 'org.postgresql:postgresql:42.2.6'
+
 
     // This dependency is found on compile classpath of this component and consumers.
     compile 'com.google.guava:guava:23.0'
@@ -29,4 +31,3 @@ dependencies {
 
 // Define the main class for the application
 mainClassName = 'App'
-
