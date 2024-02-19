@@ -23,6 +23,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -56,15 +57,15 @@ public class KafkaListener {
     private final BlockingQueue<List<String>> subscriptionUpdates = new LinkedBlockingQueue<>();
 
     /**
-     * Constructs a KafkaListener with specified thread pool configurations.
-     * Initializes Kafka consumers and subscribes to alert update topics.
+     * Initializes KafkaListener with specific thread pool configurations, sets up
+     * Kafka consumers for
+     * data and alert updates, and subscribes to initial topics.
      *
-     * @param corePoolSize    the number of threads to keep in the pool, even if
-     *                        they are idle
-     * @param maximumPoolSize the maximum number of threads to allow in the pool
-     * @param keepAliveTime   when the number of threads is greater than the core,
-     *                        this is the maximum time that excess idle threads will
-     *                        wait for new tasks before terminating
+     * @param corePoolSize    the core number of threads in the pool.
+     * @param maximumPoolSize the maximum number of threads in the pool.
+     * @param keepAliveTime   the time (in seconds) that threads exceeding the core
+     *                        pool size may remain
+     *                        idle before being terminated.
      */
     public KafkaListener(int corePoolSize, int maximumPoolSize, long keepAliveTime) {
         loadProperties();
@@ -78,7 +79,7 @@ public class KafkaListener {
     }
 
     /**
-     * Loads Kafka configuration properties from a file.
+     * Loads Kafka configuration properties from the specified properties file.
      */
     private static void loadProperties() {
         try (FileInputStream fis = new FileInputStream(KAFKA_PROPERTIES_FILE)) {
@@ -90,7 +91,10 @@ public class KafkaListener {
     }
 
     /**
-     * Subscribes the alert update consumer to the configured topic.
+     * Subscribes the Kafka consumer to a list of topics specified for alert
+     * updates.
+     * This method ensures that the consumer listens to the correct alert update
+     * topics from the start.
      */
     private void subscribeToAlertUpdateTopic() {
         String alertUpdateTopic = PROPERTIES.getProperty("alert.update.topic");
@@ -99,10 +103,9 @@ public class KafkaListener {
     }
 
     /**
-     * Starts listening for messages on data and alert update topics in separate
-     * threads.
-     * Also starts a thread to adjust the thread pool size based on subscription
-     * updates.
+     * Begins listening for messages on both data and alert update topics.
+     * It initializes separate threads for handling data messages, alert updates,
+     * and adjusting the thread pool size.
      */
     public void listen() {
         List<String> initialTopics = DatabaseUtils.getTopicList();
@@ -119,8 +122,10 @@ public class KafkaListener {
     }
 
     /**
-     * Monitors the subscription update queue and adjusts the thread pool size
-     * accordingly.
+     * Dynamically adjusts the size of the thread pool based on the current size of
+     * the subscription updates queue.
+     * It increases the pool size when the queue size exceeds a high threshold and
+     * decreases it when the queue size falls below a low threshold.
      */
     private void adjustThreadPoolSize() {
         while (running.get()) {
@@ -141,8 +146,10 @@ public class KafkaListener {
     }
 
     /**
-     * Listens for data messages on Kafka and processes them.
-     * Automatically updates consumer subscriptions based on the alert update topic.
+     * Continuously polls for data messages from Kafka, processes them, and commits
+     * offsets after processing.
+     * It ensures that all messages from a poll are processed before committing
+     * their offsets for at-least-once delivery semantics.
      */
     private void listenForDataMessages() {
         try {
@@ -153,7 +160,32 @@ public class KafkaListener {
                 }
 
                 ConsumerRecords<String, String> records = dataConsumer.poll(Duration.ofMillis(POLL_DURATION_MS));
-                records.forEach(record -> LOG.info("Received message: {}", record.value()));
+                if (!records.isEmpty()) {
+                    final CountDownLatch latch = new CountDownLatch(records.count());
+
+                    records.forEach(record -> {
+                        threadPool.execute(() -> {
+                            try {
+                                // Process the record
+                                LOG.info("Processing message: {}", record.value());
+                                // TODO: Send the message to the notification service
+                            } finally {
+                                latch.countDown();
+                            }
+                        });
+                    });
+
+                    // Wait for all messages to be processed
+                    try {
+                        latch.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        LOG.error("Interrupted while waiting for message processing to complete", e);
+                    }
+
+                    // Commit offset after all records have been processed
+                    dataConsumer.commitAsync();
+                }
             }
         } catch (WakeupException e) {
             if (!running.get()) {
@@ -165,8 +197,10 @@ public class KafkaListener {
     }
 
     /**
-     * Listens for alert updates on Kafka to adjust data consumer subscriptions
-     * dynamically.
+     * Listens for updates on the alert update topic and dynamically adjusts the
+     * subscription of the data consumer.
+     * When an alert update is received, it triggers a subscription update to
+     * include any new topics of interest.
      */
     private void listenForAlertUpdates() {
         try {
@@ -174,11 +208,13 @@ public class KafkaListener {
                 ConsumerRecords<String, String> records = alertUpdateConsumer.poll(Duration.ofMillis(POLL_DURATION_MS));
                 records.forEach(record -> {
                     LOG.debug("Received alert update: {}", record.value());
-
-                    // TODO(Wolfred): Send the alert update to the notification service for
-                    // processing.
                     try {
+
+                        // Update the subscription list for the data consumer
                         subscriptionUpdates.put(DatabaseUtils.getTopicList());
+
+                        // Commit the offset after updating the subscription
+                        alertUpdateConsumer.commitAsync();
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         LOG.error("Failed to update topic subscriptions", e);
@@ -195,9 +231,12 @@ public class KafkaListener {
     }
 
     /**
-     * Updates the subscriptions of the data consumer to the given list of topics.
+     * Updates the subscription list of the data consumer to include the specified
+     * topics.
+     * This method allows for dynamic changes in the topics that the data consumer
+     * is subscribed to.
      *
-     * @param topics the list of topics to subscribe to
+     * @param topics the list of topics to subscribe to.
      */
     private void updateDataConsumerSubscriptions(List<String> topics) {
         if (!topics.isEmpty()) {
@@ -210,8 +249,10 @@ public class KafkaListener {
     }
 
     /**
-     * Initiates a graceful shutdown of the KafkaListener, including Kafka consumers
-     * and thread pool.
+     * Gracefully shuts down the KafkaListener, ensuring that all consumers are
+     * closed and the thread pool is terminated.
+     * It attempts to process all remaining messages and commits their offsets
+     * before shutting down.
      */
     private void shutdown() {
         running.set(false);
