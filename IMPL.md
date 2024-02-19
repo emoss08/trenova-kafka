@@ -1,5 +1,8 @@
 # Former Implementations
 
+This document is a collection of former implementations of the Kafka Listener and Database Utils. It is meant to serve as a reference for future implementations.
+The file name is the current implementation in java, and the content is the former implementation in python.
+
 ### src/main/java/kafka/DatabaseUtils.java
 
 ```python
