@@ -33,31 +33,50 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+/**
+ * Utility class for database operations related to Kafka alert management.
+ * It provides functionalities to retrieve active alerts from the database,
+ * to get a list of Kafka topics based on these alerts, and to convert these
+ * alerts to JSON format.
+ */
 public class DatabaseUtils {
+    private static final Logger LOG = LoggerFactory.getLogger(KafkaListener.class);
+    private static Properties PROPERTIES = new Properties();
 
-    private static Properties properties = new Properties();
-
+    // Static block for loading database configuration properties
     static {
         loadProperties();
     }
 
+    /**
+     * Loads database configuration properties from a properties file.
+     * The properties file is expected to contain database connection details such
+     * as URL, username, and password.
+     */
     private static void loadProperties() {
-        try {
-            // Adjust path as necessary, possibly using an environment-specific strategy
-            properties.load(new FileInputStream("src/main/resources/database.properties"));
-        } catch (IOException e) {
-            System.out.println("Could not load database properties: " + e.getMessage());
-            throw new RuntimeException("Could not load database properties", e);
+        try (FileInputStream fis = new FileInputStream("src/main/resources/database.properties")) {
+            PROPERTIES.load(fis);
+        } catch (IOException ex) {
+            LOG.debug("Could not load database properties: " + ex.getMessage());
+            throw new RuntimeException("Could not load database properties", ex);
         }
     }
 
+    /**
+     * Retrieves active alerts from the database that are relevant to Kafka.
+     * An alert is considered active if it is currently within its effective date
+     * range and is marked for Kafka.
+     *
+     * @return A list of maps, where each map represents an active alert with its
+     *         column names and values.
+     */
     public static List<Map<String, Object>> getActiveAlerts() {
-        String url = properties.getProperty("url");
-        String user = properties.getProperty("username");
-        String password = properties.getProperty("password");
+        String url = PROPERTIES.getProperty("url");
+        String user = PROPERTIES.getProperty("username");
+        String password = PROPERTIES.getProperty("password");
         List<Map<String, Object>> alerts = new ArrayList<>();
 
         String query = "SELECT * FROM table_change_alert " +
@@ -70,7 +89,8 @@ public class DatabaseUtils {
         try (Connection conn = DriverManager.getConnection(url, user, password);
                 PreparedStatement pstmt = conn.prepareStatement(query)) {
 
-            // Current timestamp
+            // Use the current timestamp to filter alerts based on their effective and
+            // expiration dates.
             Timestamp now = Timestamp.valueOf(LocalDateTime.now());
             pstmt.setTimestamp(1, now);
             pstmt.setTimestamp(2, now);
@@ -79,6 +99,7 @@ public class DatabaseUtils {
                 ResultSetMetaData metaData = rs.getMetaData();
                 int columnCount = metaData.getColumnCount();
 
+                // Iterate over the result set and populate the list of alerts.
                 while (rs.next()) {
                     Map<String, Object> row = new HashMap<>();
                     for (int i = 1; i <= columnCount; i++) {
@@ -88,13 +109,19 @@ public class DatabaseUtils {
                 }
             }
         } catch (SQLException e) {
-            System.out.println("Failed to connect to the database: " + e.getMessage());
+            LOG.debug("Failed to connect to the database: " + e.getMessage());
             throw new RuntimeException("Failed to connect to the database", e);
         }
 
         return alerts;
     }
 
+    /**
+     * Extracts and returns a list of Kafka topics from the active alerts.
+     * This method filters out any null or empty topic names.
+     *
+     * @return A list of strings where each string is a Kafka topic name.
+     */
     public static List<String> getTopicList() {
         List<Map<String, Object>> alerts = getActiveAlerts();
         List<String> topics = new ArrayList<>();
@@ -105,18 +132,5 @@ public class DatabaseUtils {
             }
         }
         return topics;
-    }
-
-    public static String toJson() {
-        List<Map<String, Object>> alerts = getActiveAlerts();
-
-        ObjectMapper mapper = new ObjectMapper();
-
-        try {
-            return mapper.writeValueAsString(alerts);
-        } catch (JsonProcessingException e) {
-            e.printStackTrace();
-            throw new RuntimeException("Failed to convert alerts to JSON", e);
-        }
     }
 }

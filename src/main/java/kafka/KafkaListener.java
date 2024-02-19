@@ -35,118 +35,173 @@ import org.apache.kafka.common.errors.WakeupException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * A KafkaListener listens to data and alert update topics on Kafka.
+ * It dynamically adjusts its thread pool size based on the number of
+ * subscription updates
+ * and cleanly shuts down on application termination.
+ */
 public class KafkaListener {
-    private static final Logger log = LoggerFactory.getLogger(KafkaListener.class);
-    private static Properties properties = new Properties();
-    private final AtomicBoolean running = new AtomicBoolean(true);
-    private Consumer<String, String> dataConsumer;
-    private Consumer<String, String> alertUpdateConsumer;
-    private ThreadPoolExecutor threadPool;
-    private BlockingQueue<List<String>> subscriptionUpdates = new LinkedBlockingQueue<>();
+    private static final Logger LOG = LoggerFactory.getLogger(KafkaListener.class);
+    private static final Properties PROPERTIES = new Properties();
+    private static final String KAFKA_PROPERTIES_FILE = "src/main/resources/kafka.properties";
+    private static final int POLL_DURATION_MS = 1000;
+    private static final int QUEUE_SIZE_THRESHOLD_HIGH = 50;
+    private static final int QUEUE_SIZE_THRESHOLD_LOW = 10;
 
+    private final AtomicBoolean running = new AtomicBoolean(true);
+    private final Consumer<String, String> dataConsumer;
+    private final Consumer<String, String> alertUpdateConsumer;
+    private final ThreadPoolExecutor threadPool;
+    private final BlockingQueue<List<String>> subscriptionUpdates = new LinkedBlockingQueue<>();
+
+    /**
+     * Constructs a KafkaListener with specified thread pool configurations.
+     * Initializes Kafka consumers and subscribes to alert update topics.
+     *
+     * @param corePoolSize    the number of threads to keep in the pool, even if
+     *                        they are idle
+     * @param maximumPoolSize the maximum number of threads to allow in the pool
+     * @param keepAliveTime   when the number of threads is greater than the core,
+     *                        this is the maximum time that excess idle threads will
+     *                        wait for new tasks before terminating
+     */
     public KafkaListener(int corePoolSize, int maximumPoolSize, long keepAliveTime) {
         loadProperties();
         this.threadPool = new ThreadPoolExecutor(
                 corePoolSize, maximumPoolSize, keepAliveTime, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<Runnable>());
+                new LinkedBlockingQueue<>());
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown));
-        this.dataConsumer = new KafkaConsumer<>(properties);
-        this.alertUpdateConsumer = new KafkaConsumer<>(properties);
+        this.dataConsumer = new KafkaConsumer<>(PROPERTIES);
+        this.alertUpdateConsumer = new KafkaConsumer<>(PROPERTIES);
         subscribeToAlertUpdateTopic();
     }
 
+    /**
+     * Loads Kafka configuration properties from a file.
+     */
     private static void loadProperties() {
-        try {
-            properties.load(new FileInputStream("src/main/resources/kafka.properties"));
+        try (FileInputStream fis = new FileInputStream(KAFKA_PROPERTIES_FILE)) {
+            PROPERTIES.load(fis);
         } catch (IOException ex) {
-            log.error("Failed to load properties", ex);
+            ex.printStackTrace();
+            throw new RuntimeException("Could not load kafka properties", ex);
         }
     }
 
+    /**
+     * Subscribes the alert update consumer to the configured topic.
+     */
     private void subscribeToAlertUpdateTopic() {
-        String alertUpdateTopic = properties.getProperty("alert.update.topic");
+        String alertUpdateTopic = PROPERTIES.getProperty("alert.update.topic");
         alertUpdateConsumer.subscribe(List.of(alertUpdateTopic));
-        log.debug("Subscribed to alert update topic: {}", alertUpdateTopic);
+        LOG.debug("Subscribed to alert update topic: {}", alertUpdateTopic);
     }
 
+    /**
+     * Starts listening for messages on data and alert update topics in separate
+     * threads.
+     * Also starts a thread to adjust the thread pool size based on subscription
+     * updates.
+     */
     public void listen() {
         new Thread(this::listenForDataMessages).start();
         new Thread(this::listenForAlertUpdates).start();
         new Thread(this::adjustThreadPoolSize).start();
     }
 
+    /**
+     * Monitors the subscription update queue and adjusts the thread pool size
+     * accordingly.
+     */
     private void adjustThreadPoolSize() {
         while (running.get()) {
             try {
                 int queueSize = subscriptionUpdates.size();
-                if (queueSize > 50 && threadPool.getCorePoolSize() < threadPool.getMaximumPoolSize()) {
+                if (queueSize > QUEUE_SIZE_THRESHOLD_HIGH
+                        && threadPool.getCorePoolSize() < threadPool.getMaximumPoolSize()) {
                     threadPool.setCorePoolSize(threadPool.getCorePoolSize() + 1);
-                } else if (queueSize < 10 && threadPool.getCorePoolSize() > 1) {
+                } else if (queueSize < QUEUE_SIZE_THRESHOLD_LOW && threadPool.getCorePoolSize() > 1) {
                     threadPool.setCorePoolSize(threadPool.getCorePoolSize() - 1);
                 }
                 TimeUnit.SECONDS.sleep(10);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                log.error("ThreadPool adjustment thread interrupted", e);
+                LOG.error("ThreadPool adjustment thread interrupted", e);
             }
         }
     }
 
+    /**
+     * Listens for data messages on Kafka and processes them.
+     * Automatically updates consumer subscriptions based on the alert update topic.
+     */
     private void listenForDataMessages() {
         try {
-            updateDataConsumerSubscriptions(DatabaseUtils.getTopicList());
-
             while (running.get()) {
                 List<String> newTopics = subscriptionUpdates.poll();
                 if (newTopics != null) {
                     updateDataConsumerSubscriptions(newTopics);
                 }
 
-                ConsumerRecords<String, String> records = dataConsumer.poll(Duration.ofMillis(1000));
-                records.forEach(record -> log.info("Received message: {}", record.value()));
+                ConsumerRecords<String, String> records = dataConsumer.poll(Duration.ofMillis(POLL_DURATION_MS));
+                records.forEach(record -> LOG.info("Received message: {}", record.value()));
             }
         } catch (WakeupException e) {
             if (!running.get()) {
-                log.info("Shutting down data message listener...");
+                LOG.info("Shutting down data message listener...");
             }
         } finally {
             dataConsumer.close();
         }
     }
 
+    /**
+     * Listens for alert updates on Kafka to adjust data consumer subscriptions
+     * dynamically.
+     */
     private void listenForAlertUpdates() {
         try {
             while (running.get()) {
-                ConsumerRecords<String, String> records = alertUpdateConsumer.poll(Duration.ofMillis(1000));
+                ConsumerRecords<String, String> records = alertUpdateConsumer.poll(Duration.ofMillis(POLL_DURATION_MS));
                 records.forEach(record -> {
-                    log.debug("Received alert update: {}", record.value());
+                    LOG.debug("Received alert update: {}", record.value());
                     try {
                         subscriptionUpdates.put(DatabaseUtils.getTopicList());
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
-                        log.error("Failed to update topic subscriptions", e);
+                        LOG.error("Failed to update topic subscriptions", e);
                     }
                 });
             }
         } catch (WakeupException e) {
             if (!running.get()) {
-                log.info("Shutting down alert update listener...");
+                LOG.info("Shutting down alert update listener...");
             }
         } finally {
             alertUpdateConsumer.close();
         }
     }
 
+    /**
+     * Updates the subscriptions of the data consumer to the given list of topics.
+     *
+     * @param topics the list of topics to subscribe to
+     */
     private void updateDataConsumerSubscriptions(List<String> topics) {
         if (!topics.isEmpty()) {
             dataConsumer.unsubscribe();
             dataConsumer.subscribe(topics);
-            log.debug("Data consumer subscriptions updated to topics: {}", String.join(", ", topics));
+            LOG.debug("Data consumer subscriptions updated to topics: {}", String.join(", ", topics));
         } else {
-            log.debug("No active table changes to subscribe to.");
+            LOG.debug("No active table changes to subscribe to.");
         }
     }
 
+    /**
+     * Initiates a graceful shutdown of the KafkaListener, including Kafka consumers
+     * and thread pool.
+     */
     private void shutdown() {
         running.set(false);
         dataConsumer.wakeup();
@@ -159,7 +214,7 @@ public class KafkaListener {
         } catch (InterruptedException e) {
             threadPool.shutdownNow();
         }
-        log.info("KafkaListener shutdown completed.");
+        LOG.info("KafkaListener shutdown completed.");
     }
 
     public static void main(String[] args) {
