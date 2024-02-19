@@ -20,16 +20,15 @@ package kafka;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.kafka.clients.consumer.Consumer;
-import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.errors.WakeupException;
@@ -38,107 +37,103 @@ import org.slf4j.LoggerFactory;
 
 public class KafkaListener {
     private static final Logger log = LoggerFactory.getLogger(KafkaListener.class);
-
     private static Properties properties = new Properties();
     private final AtomicBoolean running = new AtomicBoolean(true);
-    private Consumer<String, String> consumer;
+    private Consumer<String, String> dataConsumer;
+    private Consumer<String, String> alertUpdateConsumer;
     private ExecutorService threadPool;
+    private BlockingQueue<List<String>> subscriptionUpdates = new LinkedBlockingQueue<>();
 
     public KafkaListener(int threadPoolSize) {
-        this.threadPool = Executors.newFixedThreadPool(threadPoolSize);
-        Runtime.getRuntime().addShutdownHook(new Thread(this.shutdown));
-    }
-
-    static {
         loadProperties();
+        this.threadPool = Executors.newFixedThreadPool(threadPoolSize);
+        Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown));
+        this.dataConsumer = new KafkaConsumer<>(properties);
+        this.alertUpdateConsumer = new KafkaConsumer<>(properties);
+        subscribeToAlertUpdateTopic();
     }
 
     private static void loadProperties() {
         try {
             properties.load(new FileInputStream("src/main/resources/kafka.properties"));
         } catch (IOException ex) {
-            ex.printStackTrace();
+            log.error("Failed to load properties", ex);
         }
+    }
+
+    private void subscribeToAlertUpdateTopic() {
+        String alertUpdateTopic = properties.getProperty("alert.update.topic");
+        alertUpdateConsumer.subscribe(List.of(alertUpdateTopic));
+        log.debug("Subscribed to alert update topic: {}", alertUpdateTopic);
     }
 
     public void listen() {
-        connect();
+        new Thread(this::listenForDataMessages).start();
+        new Thread(this::listenForAlertUpdates).start();
+    }
 
-        List<String> topics = getTopicList();
-        if (topics.isEmpty()) {
-            log.info("No topics to subscribe to");
-            return;
-        }
-
-        consumer.subscribe(topics);
-
+    private void listenForDataMessages() {
         try {
+            updateDataConsumerSubscriptions(DatabaseUtils.getTopicList());
+
             while (running.get()) {
-                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
-                for (ConsumerRecord<String, String> record : records) {
-                    log.info("Received message: " + record.value());
+                List<String> newTopics = subscriptionUpdates.poll();
+                if (newTopics != null) {
+                    updateDataConsumerSubscriptions(newTopics);
                 }
+
+                ConsumerRecords<String, String> records = dataConsumer.poll(Duration.ofMillis(1000));
+                records.forEach(record -> log.info("Received message: {}", record.value()));
             }
         } catch (WakeupException e) {
             if (!running.get()) {
-                log.info("Shutting down Kafka listener....");
+                log.info("Shutting down data message listener...");
             }
-        } catch (Exception e) {
-            log.info("Error fetching messages: " + e.getMessage());
         } finally {
-            consumer.close();
+            dataConsumer.close();
         }
     }
 
-    private void connect() {
-        consumer = new KafkaConsumer<>(properties);
-    }
-
-    public static List<String> getTopicList() {
-        List<Map<String, Object>> alerts = DatabaseUtils.getActiveAlerts();
-        List<String> topics = new ArrayList<>();
-
-        for (Map<String, Object> alert : alerts) {
-            String topic = (String) alert.get("topic");
-            if (topic != null && !topic.isEmpty()) {
-                topics.add(topic);
-            }
-        }
-
-        return topics;
-    }
-
-    private static List<ConsumerRecords<String, String>> getMessages(Consumer<String, String> consumer, long timeoutMs,
-            int maxMessages) {
-        List<ConsumerRecords<String, String>> validMessages = new ArrayList<>();
+    private void listenForAlertUpdates() {
         try {
-            while (validMessages.size() < maxMessages) {
-                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(timeoutMs));
-                if (!records.isEmpty()) {
-                    validMessages.add(records);
-                }
-                // Break the loop if no records are fetched
-                if (records.count() == 0) {
-                    break;
-                }
+            while (running.get()) {
+                ConsumerRecords<String, String> records = alertUpdateConsumer.poll(Duration.ofMillis(1000));
+                records.forEach(record -> {
+                    log.debug("Received alert update: {}", record.value());
+                    try {
+                        subscriptionUpdates.put(DatabaseUtils.getTopicList());
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        log.error("Failed to update topic subscriptions", e);
+                    }
+                });
             }
         } catch (WakeupException e) {
-            log.info("Consumer woken up");
-        } catch (Exception e) {
-            log.info("Error fetching messages: " + e.getMessage());
+            if (!running.get()) {
+                log.info("Shutting down alert update listener...");
+            }
         } finally {
-            consumer.close();
+            alertUpdateConsumer.close();
         }
-        return validMessages;
     }
 
-    private Runnable shutdown = () -> {
-        running.set(false);
-        if (consumer != null) {
-            consumer.wakeup();
+    private void updateDataConsumerSubscriptions(List<String> topics) {
+        if (!topics.isEmpty()) {
+            dataConsumer.unsubscribe();
+            dataConsumer.subscribe(topics);
+            log.debug("Data consumer subscriptions updated to topics: {}", String.join(", ", topics));
+        } else {
+            log.debug("No active table changes to subscribe to.");
         }
+    }
+
+    private void shutdown() {
+        running.set(false);
+        dataConsumer.wakeup();
+        alertUpdateConsumer.wakeup();
         threadPool.shutdown();
-    };
+        log.info("KafkaListener shutdown initiated.");
+    }
 
     public static void main(String[] args) {
         KafkaListener listener = new KafkaListener(10);
