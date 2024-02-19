@@ -105,6 +105,14 @@ public class KafkaListener {
      * updates.
      */
     public void listen() {
+        List<String> initialTopics = DatabaseUtils.getTopicList();
+        if (!initialTopics.isEmpty()) {
+            dataConsumer.subscribe(initialTopics);
+            LOG.info("Data consumer initially subscribed to topics: {}", initialTopics);
+        } else {
+            LOG.warn("No topics available for initial subscription.");
+        }
+
         new Thread(this::listenForDataMessages).start();
         new Thread(this::listenForAlertUpdates).start();
         new Thread(this::adjustThreadPoolSize).start();
@@ -166,6 +174,9 @@ public class KafkaListener {
                 ConsumerRecords<String, String> records = alertUpdateConsumer.poll(Duration.ofMillis(POLL_DURATION_MS));
                 records.forEach(record -> {
                     LOG.debug("Received alert update: {}", record.value());
+
+                    // TODO(Wolfred): Send the alert update to the notification service for
+                    // processing.
                     try {
                         subscriptionUpdates.put(DatabaseUtils.getTopicList());
                     } catch (InterruptedException e) {
