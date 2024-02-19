@@ -95,6 +95,18 @@ public class DatabaseUtils {
         return alerts;
     }
 
+    public static List<String> getTopicList() {
+        List<Map<String, Object>> alerts = getActiveAlerts();
+        List<String> topics = new ArrayList<>();
+        for (Map<String, Object> alert : alerts) {
+            String topic = (String) alert.get("topic");
+            if (topic != null && !topic.isEmpty()) {
+                topics.add(topic);
+            }
+        }
+        return topics;
+    }
+
     public static String toJson() {
         List<Map<String, Object>> alerts = getActiveAlerts();
 
