@@ -23,9 +23,9 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.kafka.clients.consumer.Consumer;
@@ -41,12 +41,14 @@ public class KafkaListener {
     private final AtomicBoolean running = new AtomicBoolean(true);
     private Consumer<String, String> dataConsumer;
     private Consumer<String, String> alertUpdateConsumer;
-    private ExecutorService threadPool;
+    private ThreadPoolExecutor threadPool;
     private BlockingQueue<List<String>> subscriptionUpdates = new LinkedBlockingQueue<>();
 
-    public KafkaListener(int threadPoolSize) {
+    public KafkaListener(int corePoolSize, int maximumPoolSize, long keepAliveTime) {
         loadProperties();
-        this.threadPool = Executors.newFixedThreadPool(threadPoolSize);
+        this.threadPool = new ThreadPoolExecutor(
+                corePoolSize, maximumPoolSize, keepAliveTime, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<Runnable>());
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown));
         this.dataConsumer = new KafkaConsumer<>(properties);
         this.alertUpdateConsumer = new KafkaConsumer<>(properties);
@@ -70,6 +72,24 @@ public class KafkaListener {
     public void listen() {
         new Thread(this::listenForDataMessages).start();
         new Thread(this::listenForAlertUpdates).start();
+        new Thread(this::adjustThreadPoolSize).start();
+    }
+
+    private void adjustThreadPoolSize() {
+        while (running.get()) {
+            try {
+                int queueSize = subscriptionUpdates.size();
+                if (queueSize > 50 && threadPool.getCorePoolSize() < threadPool.getMaximumPoolSize()) {
+                    threadPool.setCorePoolSize(threadPool.getCorePoolSize() + 1);
+                } else if (queueSize < 10 && threadPool.getCorePoolSize() > 1) {
+                    threadPool.setCorePoolSize(threadPool.getCorePoolSize() - 1);
+                }
+                TimeUnit.SECONDS.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.error("ThreadPool adjustment thread interrupted", e);
+            }
+        }
     }
 
     private void listenForDataMessages() {
@@ -132,11 +152,18 @@ public class KafkaListener {
         dataConsumer.wakeup();
         alertUpdateConsumer.wakeup();
         threadPool.shutdown();
-        log.info("KafkaListener shutdown initiated.");
+        try {
+            if (!threadPool.awaitTermination(10, TimeUnit.SECONDS)) {
+                threadPool.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            threadPool.shutdownNow();
+        }
+        log.info("KafkaListener shutdown completed.");
     }
 
     public static void main(String[] args) {
-        KafkaListener listener = new KafkaListener(10);
+        KafkaListener listener = new KafkaListener(1, 10, 60);
         listener.listen();
     }
 }
