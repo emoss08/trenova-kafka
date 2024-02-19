@@ -33,6 +33,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 public class DatabaseUtils {
 
     private static Properties properties = new Properties();
@@ -92,8 +95,16 @@ public class DatabaseUtils {
         return alerts;
     }
 
-    public static void main(String[] args) {
+    public static String toJson() {
         List<Map<String, Object>> alerts = getActiveAlerts();
-        alerts.forEach(System.out::println);
+
+        ObjectMapper mapper = new ObjectMapper();
+
+        try {
+            return mapper.writeValueAsString(alerts);
+        } catch (JsonProcessingException e) {
+            e.printStackTrace();
+            throw new RuntimeException("Failed to convert alerts to JSON", e);
+        }
     }
 }
